@@ -840,6 +840,7 @@ class TapestrySession:
         """
         obs = self._try_json_api(child_id)
         if obs is not None:
+            self._backfill_truncated_media(obs)
             return obs
         return self._scrape_observation_list(child_id)
 
@@ -899,6 +900,57 @@ class TapestrySession:
 
         log.info("API returned %d observations total", len(all_obs))
         return all_obs if all_obs else None
+
+    def _backfill_truncated_media(self, observations: list[dict]) -> None:
+        """
+        The /api/4/observations/list endpoint only returns a *preview* of each
+        observation's media — at most 3 items — while the true total is given by
+        the "mediaCount" field.  For any observation whose preview is truncated,
+        fetch the full detail (/api/4/observations/get/{id}) and replace its
+        media (and documents) with the complete lists, so every asset downloads.
+        """
+        truncated = [
+            o for o in observations
+            if isinstance(o.get("mediaCount"), int)
+            and o["mediaCount"] > len(o.get("media") or [])
+        ]
+        if not truncated:
+            return
+
+        log.info(
+            "%d observation(s) have more media than the list preview returned "
+            "(preview caps at 3) — fetching full media lists …",
+            len(truncated),
+        )
+        for o in tqdm(truncated, desc="Fetching full media lists"):
+            obs_id = o.get("id")
+            if obs_id is None:
+                continue
+            url = f"{BASE_URL}/api/4/observations/get/{obs_id}"
+            try:
+                r = self.s.get(url, headers=self._api4_headers, timeout=30)
+                r.raise_for_status()
+                detail = r.json()
+            except Exception as exc:
+                log.warning(
+                    "Could not fetch full media for observation %s "
+                    "(preview had %d of %s): %s",
+                    obs_id, len(o.get("media") or []), o.get("mediaCount"), exc,
+                )
+                continue
+
+            if not isinstance(detail, dict):
+                continue
+            before = len(o.get("media") or [])
+            if isinstance(detail.get("media"), list):
+                o["media"] = detail["media"]
+            if isinstance(detail.get("documents"), list):
+                o["documents"] = detail["documents"]
+            log.debug(
+                "Observation %s: media %d → %d (mediaCount=%s)",
+                obs_id, before, len(o.get("media") or []), o.get("mediaCount"),
+            )
+            time.sleep(0.15)
 
     # ── HTML scraping ─────────────────────────────────────────────────────────
 
@@ -1188,6 +1240,30 @@ def _looks_like_asset(url: str) -> bool:
 # ── Organiser ─────────────────────────────────────────────────────────────────
 
 
+def _remove_legacy_media_files(
+    obs_dir: Path, date_prefix: str, keep: set[str]
+) -> int:
+    """
+    Delete media files left by the earlier positional-index naming scheme
+    ("<date>_001.jpg", "<date>_002.mp4", …) that are not part of the current
+    id-named set *keep*.  Lets folders written by older runs migrate to stable
+    id filenames without leaving duplicated assets behind.  Returns the number
+    of files removed.
+    """
+    legacy_re = re.compile(rf"^{re.escape(date_prefix)}_\d{{3}}\.[A-Za-z0-9]+$")
+    removed = 0
+    for f in obs_dir.iterdir():
+        if not f.is_file() or f.name in keep or not legacy_re.match(f.name):
+            continue
+        try:
+            f.unlink()
+            removed += 1
+            log.debug("Migrated: removed legacy-named file %s", f.name)
+        except OSError as exc:
+            log.debug("Could not remove %s: %s", f.name, exc)
+    return removed
+
+
 def organise(
     observations: list[dict],
     output_dir: Path,
@@ -1197,13 +1273,15 @@ def organise(
     Directory layout:
         <output>/<child_name>/<YYYY-MM-DD_<title>>/
             observation.json
-            YYYY-MM-DD_001.jpg
-            YYYY-MM-DD_002.mp4
+            YYYY-MM-DD_<mediaId>.jpg
+            YYYY-MM-DD_<mediaId>.mp4
             …
+    Media files are named after each asset's stable Tapestry id, so every run
+    maps an asset to the same filename and only fetches what is missing.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    n_ok = n_skip = n_fail = 0
+    n_ok = n_skip = n_fail = n_migrated = 0
 
     for obs in tqdm(observations, desc="Organising observations"):
         obs_id = str(obs.get("id", "unknown"))
@@ -1265,6 +1343,8 @@ def organise(
                 elif isinstance(item, dict) and item.get("url"):
                     media_items.append(item)
 
+        written: set[str] = set()
+        obs_failed = False
         for idx, item in enumerate(media_items, start=1):
             url = (item.get("original_url") or item.get("url")
                    or item.get("src") or "")
@@ -1279,7 +1359,16 @@ def organise(
                 ext = ".jpg" if item_type == "image" else (
                       ".mp4" if item_type == "video" else ".bin")
 
-            filename = f"{date_prefix}_{idx:03d}{ext}"
+            # Name each file after the asset's stable Tapestry id so it always
+            # maps to the same filename regardless of position or sibling count.
+            # Fall back to a positional index only for legacy items with no id.
+            media_id = item.get("id")
+            stem = (f"{date_prefix}_{media_id}" if media_id is not None
+                    else f"{date_prefix}_{idx:03d}")
+            filename = f"{stem}{ext}"
+            if filename in written:      # two assets sharing an id + ext (rare)
+                filename = f"{stem}_{idx:03d}{ext}"
+            written.add(filename)
             dest = obs_dir / filename
 
             if session.download(url, dest):
@@ -1291,12 +1380,21 @@ def organise(
                 n_ok += 1
             else:
                 n_fail += 1
+                obs_failed = True
+
+        # Migrate folders written by the old positional-index scheme by dropping
+        # superseded "<date>_NNN.ext" files — but only once every asset for this
+        # observation is safely downloaded, so a transient failure never deletes
+        # the sole local copy of an asset.
+        if not obs_failed:
+            n_migrated += _remove_legacy_media_files(obs_dir, date_prefix, written)
 
         time.sleep(0.1)
 
     log.info(
-        "Complete — downloaded: %d  no-date skipped: %d  failed: %d",
-        n_ok, n_skip, n_fail,
+        "Complete — downloaded: %d  no-date skipped: %d  failed: %d"
+        "  legacy files migrated: %d",
+        n_ok, n_skip, n_fail, n_migrated,
     )
 
 
