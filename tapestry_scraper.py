@@ -26,7 +26,7 @@ import platform
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
@@ -894,16 +894,20 @@ class TapestrySession:
 
     # ── Observation list ──────────────────────────────────────────────────────
 
-    def get_observations(self, child_id: str | None = None) -> list[dict]:
+    def get_observations(self, child_id: str | None = None,
+                         since: datetime | None = None) -> list[dict]:
         """
         Return all observations as a list of dicts.
         Tries JSON API first; falls back to HTML page scraping.
+        With *since*, drop observations dated before it — before the per-item
+        detail fetches, so a nightly run only does work for recent posts.
         """
         obs = self._try_json_api(child_id)
         if obs is not None:
+            obs = _filter_since(obs, since)
             self._backfill_truncated_media(obs)
             return obs
-        return self._scrape_observation_list(child_id)
+        return _filter_since(self._scrape_observation_list(child_id), since)
 
     def _try_json_api(self, child_id: str | None) -> list[dict] | None:
         """
@@ -1281,6 +1285,18 @@ class TapestrySession:
 # ── Helper ────────────────────────────────────────────────────────────────────
 
 
+def _filter_since(observations: list[dict], since: datetime | None) -> list[dict]:
+    """Keep observations dated on/after *since*. Undated ones are kept so the
+    organiser can report them rather than them vanishing silently."""
+    if since is None:
+        return observations
+    kept = [o for o in observations
+            if (d := parse_obs_date(o)) is None or d >= since]
+    log.info("--since-days: %d of %d observation(s) are recent enough",
+             len(kept), len(observations))
+    return kept
+
+
 def _looks_like_asset(url: str) -> bool:
     """Return True if the URL looks like a media/document asset."""
     if not url or url.startswith("data:"):
@@ -1491,6 +1507,9 @@ examples:
                    help="Print available children and exit")
     p.add_argument("--limit", metavar="N", type=int,
                    help="Only process the first N observations (useful for testing)")
+    p.add_argument("--since-days", metavar="N", type=int,
+                   help="Only process observations from the last N days "
+                        "(for scheduled runs; omit for a full backfill)")
     p.add_argument("--session-cache", metavar="FILE",
                    default=os.environ.get("TAPESTRY_SESSION_CACHE"),
                    help="Reuse the login session stored in FILE, logging in only "
@@ -1533,7 +1552,9 @@ def main() -> None:
                 print(f"{cid!s:<14}  {name}")
         return
 
-    observations = ts.get_observations(child_id=args.child)
+    since = (datetime.now() - timedelta(days=args.since_days)
+             if args.since_days else None)
+    observations = ts.get_observations(child_id=args.child, since=since)
 
     if not observations:
         log.warning(
