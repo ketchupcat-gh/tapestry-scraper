@@ -1345,10 +1345,37 @@ def _remove_legacy_media_files(
     return removed
 
 
+# ── Download history ──────────────────────────────────────────────────────────
+#
+# Records every asset ever downloaded, keyed by its path inside the export
+# folder. Deciding "already have it" from this rather than from the files on
+# disk lets a cleanup job remove files once they are safely in a photo library
+# without the next run fetching them all again.
+
+STATE_FILE = "state.json"
+
+
+def load_history(path: Path) -> dict[str, str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Download history {path} is not a JSON object")
+    return data
+
+
+def save_history(path: Path, history: dict[str, str]) -> None:
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(history, indent=1, sort_keys=True), encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def organise(
     observations: list[dict],
     output_dir: Path,
     session: TapestrySession,
+    use_history: bool = True,
 ) -> dict[str, int]:
     """
     Directory layout:
@@ -1361,6 +1388,12 @@ def organise(
     maps an asset to the same filename and only fetches what is missing.
     """
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # A corrupt history is fatal rather than treated as empty: an empty history
+    # would re-download every asset the cleanup job has already removed.
+    state_path = output_dir / STATE_FILE
+    history = load_history(state_path)
+    history_dirty = 0
 
     n_ok = n_existing = n_skip = n_fail = n_migrated = 0
 
@@ -1452,10 +1485,18 @@ def organise(
             written.add(filename)
             dest = obs_dir / filename
 
+            rel = dest.relative_to(output_dir).as_posix()
+            if use_history and rel in history:
+                n_existing += 1
+                continue
+
             # Files from earlier runs are already stamped; rewriting their
             # metadata every night would churn the archive for no gain.
+            # Recording them covers files downloaded before the history existed.
             if dest.exists() and dest.stat().st_size > 0:
                 n_existing += 1
+                history[rel] = datetime.now().isoformat(timespec="seconds")
+                history_dirty += 1
                 continue
 
             if session.download(url, dest):
@@ -1465,6 +1506,12 @@ def organise(
                 elif ext in (".mp4", ".m4v", ".mov"):
                     embed_video_metadata(dest, obs_dt, obs)
                 n_ok += 1
+                history[rel] = datetime.now().isoformat(timespec="seconds")
+                history_dirty += 1
+                # Save as we go, so a killed run never forgets what it fetched.
+                if history_dirty >= 25:
+                    save_history(state_path, history)
+                    history_dirty = 0
             else:
                 n_fail += 1
                 obs_failed = True
@@ -1477,6 +1524,9 @@ def organise(
             n_migrated += _remove_legacy_media_files(obs_dir, date_prefix, written)
 
         time.sleep(0.1)
+
+    if history_dirty:
+        save_history(state_path, history)
 
     log.info(
         "Complete — downloaded: %d  already had: %d  no-date skipped: %d"
@@ -1530,6 +1580,9 @@ examples:
     p.add_argument("--since-days", metavar="N", type=int,
                    help="Only process observations from the last N days "
                         "(for scheduled runs; omit for a full backfill)")
+    p.add_argument("--ignore-history", action="store_true",
+                   help="Re-download anything missing from disk, even if the "
+                        "download history (state.json) says it was fetched before")
     p.add_argument("--session-cache", metavar="FILE",
                    default=os.environ.get("TAPESTRY_SESSION_CACHE"),
                    help="Reuse the login session stored in FILE, logging in only "
@@ -1591,7 +1644,8 @@ def main() -> int:
         log.info("--limit %d: processing %d observation(s)", args.limit, len(observations))
 
     log.info("Processing %d observations → %s", len(observations), output_dir)
-    counts = organise(observations, output_dir, ts)
+    counts = organise(observations, output_dir, ts,
+                      use_history=not args.ignore_history)
     if cache:
         ts.save_session(cache)   # cookies rotate during a run; keep the newest
     print_summary(counts)
