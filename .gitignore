@@ -20,3 +20,6 @@ Thumbs.db
 # Credentials / env
 .env
 *.env
+tapestry_export/
+__pycache__/
+debug_*.html
