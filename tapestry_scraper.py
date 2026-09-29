@@ -317,7 +317,11 @@ def _build_xmp_packet(dt: datetime, title: str, notes: str,
         items = "".join(f"<rdf:li>{escape(v)}</rdf:li>" for v in values)
         return f"<{tag}><rdf:Bag>{items}</rdf:Bag></{tag}>"
 
-    description = " — ".join(p for p in (title, notes) if p)
+    # dc:title already carries the title, and Apple Photos shows title and
+    # description side by side, so repeating it here only duplicates it. The
+    # combined "title — notes" form stays in EXIF/IPTC for viewers that have
+    # no title field.
+    description = notes
 
     return (
         '<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>'
@@ -1564,7 +1568,8 @@ def main() -> int:
             print("─" * 40)
             for c in children:
                 cid  = c.get("id", "?")
-                name = c.get("name") or c.get("full_name") or c.get("display_name", "?")
+                name = (c.get("fullName") or c.get("name") or c.get("full_name")
+                        or c.get("display_name", "?"))
                 print(f"{cid!s:<14}  {name}")
         return 0
 
