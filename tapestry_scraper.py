@@ -644,6 +644,67 @@ class TapestrySession:
             "Accept": "application/json",
         }
 
+    # ── Session cache ─────────────────────────────────────────────────────────
+    #
+    # Logging in from scratch on every scheduled run is noisy for the account
+    # holder, so the authenticated cookies (plus the CSRF token and school slug
+    # the API needs) can be persisted and reused until the server rejects them.
+
+    def load_session(self, path: Path) -> bool:
+        """Restore a cached session from *path*. Returns True only if the
+        server still accepts it."""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return False
+        except Exception as exc:
+            log.debug("Ignoring unreadable session cache %s: %s", path, exc)
+            return False
+
+        for c in data.get("cookies", []):
+            self.s.cookies.set(c["name"], c["value"],
+                               domain=c.get("domain", ""), path=c.get("path", "/"))
+        self._csrf = data.get("csrf", "")
+        self._school_slug = data.get("school_slug", "")
+
+        try:
+            r = self.s.get(f"{BASE_URL}/api/4/children/list",
+                           headers=self._api4_headers, timeout=20,
+                           allow_redirects=False)
+            ok = (r.status_code == 200
+                  and "json" in r.headers.get("Content-Type", ""))
+        except requests.RequestException as exc:
+            log.debug("Session cache check failed: %s", exc)
+            ok = False
+
+        if ok:
+            log.info("Reusing cached session from %s", path)
+            return True
+
+        log.info("Cached session no longer accepted — logging in again")
+        self.s.cookies.clear()
+        self._csrf = ""
+        self._school_slug = ""
+        return False
+
+    def save_session(self, path: Path) -> None:
+        """Write the current session to *path*, readable by the owner only."""
+        data = {
+            "cookies": [
+                {"name": c.name, "value": c.value,
+                 "domain": c.domain, "path": c.path}
+                for c in self.s.cookies
+            ],
+            "csrf": self._csrf,
+            "school_slug": self._school_slug,
+        }
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+
     # ── Internal helpers ──────────────────────────────────────────────────────
 
     def _soup(self, url: str, **kwargs) -> tuple[BeautifulSoup, requests.Response]:
@@ -1430,6 +1491,10 @@ examples:
                    help="Print available children and exit")
     p.add_argument("--limit", metavar="N", type=int,
                    help="Only process the first N observations (useful for testing)")
+    p.add_argument("--session-cache", metavar="FILE",
+                   default=os.environ.get("TAPESTRY_SESSION_CACHE"),
+                   help="Reuse the login session stored in FILE, logging in only "
+                        "when it has expired  (env: TAPESTRY_SESSION_CACHE)")
     p.add_argument("-v", "--verbose",  action="store_true",
                    help="Enable debug logging")
     return p
@@ -1448,7 +1513,11 @@ def main() -> None:
     output_dir = Path(args.output).expanduser().resolve()
 
     ts = TapestrySession()
-    ts.login(args.email, args.password)
+    cache = Path(args.session_cache).expanduser() if args.session_cache else None
+    if not (cache and ts.load_session(cache)):
+        ts.login(args.email, args.password)
+    if cache:
+        ts.save_session(cache)
 
     if args.list_children:
         children = ts.get_children()
