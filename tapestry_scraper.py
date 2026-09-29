@@ -1345,7 +1345,7 @@ def organise(
     observations: list[dict],
     output_dir: Path,
     session: TapestrySession,
-) -> None:
+) -> dict[str, int]:
     """
     Directory layout:
         <output>/<child_name>/<YYYY-MM-DD_<title>>/
@@ -1358,7 +1358,7 @@ def organise(
     """
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    n_ok = n_skip = n_fail = n_migrated = 0
+    n_ok = n_existing = n_skip = n_fail = n_migrated = 0
 
     for obs in tqdm(observations, desc="Organising observations"):
         obs_id = str(obs.get("id", "unknown"))
@@ -1448,6 +1448,12 @@ def organise(
             written.add(filename)
             dest = obs_dir / filename
 
+            # Files from earlier runs are already stamped; rewriting their
+            # metadata every night would churn the archive for no gain.
+            if dest.exists() and dest.stat().st_size > 0:
+                n_existing += 1
+                continue
+
             if session.download(url, dest):
                 set_file_times(dest, obs_dt)
                 if ext in (".jpg", ".jpeg"):
@@ -1469,10 +1475,20 @@ def organise(
         time.sleep(0.1)
 
     log.info(
-        "Complete — downloaded: %d  no-date skipped: %d  failed: %d"
-        "  legacy files migrated: %d",
-        n_ok, n_skip, n_fail, n_migrated,
+        "Complete — downloaded: %d  already had: %d  no-date skipped: %d"
+        "  failed: %d  legacy files migrated: %d",
+        n_ok, n_existing, n_skip, n_fail, n_migrated,
     )
+    return {"new": n_ok, "existing": n_existing, "undated": n_skip,
+            "failed": n_fail}
+
+
+def print_summary(counts: dict[str, int]) -> None:
+    """One machine-readable line for a calling job to parse. Keep the format
+    stable — scheduled wrappers grep for it."""
+    print("TAPESTRY_SUMMARY " + " ".join(
+        f"{k}={counts.get(k, 0)}" for k in ("new", "existing", "undated", "failed")
+    ), flush=True)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -1519,7 +1535,7 @@ examples:
     return p
 
 
-def main() -> None:
+def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     if not args.email or not args.password:
@@ -1550,26 +1566,43 @@ def main() -> None:
                 cid  = c.get("id", "?")
                 name = c.get("name") or c.get("full_name") or c.get("display_name", "?")
                 print(f"{cid!s:<14}  {name}")
-        return
+        return 0
 
     since = (datetime.now() - timedelta(days=args.since_days)
              if args.since_days else None)
     observations = ts.get_observations(child_id=args.child, since=since)
 
     if not observations:
-        log.warning(
-            "No observations found. The account may be empty, or the site "
-            "structure has changed. Try --verbose to see what's happening."
-        )
-        sys.exit(0)
+        if since is None:
+            log.warning(
+                "No observations found. The account may be empty, or the site "
+                "structure has changed. Try --verbose to see what's happening."
+            )
+        print_summary({})
+        return 0
 
     if args.limit:
         observations = observations[: args.limit]
         log.info("--limit %d: processing %d observation(s)", args.limit, len(observations))
 
     log.info("Processing %d observations → %s", len(observations), output_dir)
-    organise(observations, output_dir, ts)
+    counts = organise(observations, output_dir, ts)
+    if cache:
+        ts.save_session(cache)   # cookies rotate during a run; keep the newest
+    print_summary(counts)
+    # Partial downloads are a failure: the caller must hear about them, and a
+    # re-run picks up exactly what is missing.
+    return 2 if counts["failed"] else 0
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except Exception as exc:
+        # Login failures, expired sessions and API errors all land here.
+        # Exit non-zero so schedulers see a failure without scraping the log.
+        log.error("%s", exc)
+        log.debug("Traceback:", exc_info=True)
+        sys.exit(1)
