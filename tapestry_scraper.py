@@ -1414,10 +1414,13 @@ examples:
   %(prog)s -e you@example.com -p hunter2 -o ./export --verbose
         """,
     )
-    p.add_argument("-e", "--email",    required=True, metavar="EMAIL",
-                   help="Tapestry login email address")
-    p.add_argument("-p", "--password", required=True, metavar="PASSWORD",
-                   help="Tapestry login password")
+    p.add_argument("-e", "--email",    metavar="EMAIL",
+                   default=os.environ.get("TAPESTRY_EMAIL"),
+                   help="Tapestry login email address  (env: TAPESTRY_EMAIL)")
+    p.add_argument("-p", "--password", metavar="PASSWORD",
+                   default=os.environ.get("TAPESTRY_PASSWORD"),
+                   help="Tapestry login password  (env: TAPESTRY_PASSWORD; "
+                        "prefer the env var so the password never shows in `ps`)")
     p.add_argument("-o", "--output",   default="./tapestry_export",
                    metavar="DIR",
                    help="Output directory  (default: ./tapestry_export)")
@@ -1435,6 +1438,9 @@ examples:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+    if not args.email or not args.password:
+        parser.error("email and password are required "
+                     "(-e/-p, or TAPESTRY_EMAIL/TAPESTRY_PASSWORD)")
 
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
